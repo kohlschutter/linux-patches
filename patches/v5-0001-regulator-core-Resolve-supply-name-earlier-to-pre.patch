@@ -1,0 +1,119 @@
+From b2ec45819677a1dfaa5a55c6168a9f05dbb215fb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20Kohlsch=C3=BCtter?= <christian@kohlschutter.com>
+Date: Fri, 22 Jul 2022 19:42:27 +0200
+Subject: [PATCH v5] regulator: core: Resolve supply name earlier to prevent
+ double-init
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously, an unresolved regulator supply reference upon calling
+regulator_register on an always-on or boot-on regulator caused
+set_machine_constraints to be called twice.
+
+This in turn may initialize the regulator twice, leading to voltage
+glitches that are timing-dependent. A simple, unrelated configuration
+change may be enough to hide this problem, only to be surfaced by
+chance.
+
+One such example is the SD-Card voltage regulator in a NanoPI R4S that
+would not initialize reliably unless the registration flow was just
+complex enough to allow the regulator to properly reset between calls.
+
+Fix this by re-arranging regulator_register, trying resolve the
+regulator's supply early enough that set_machine_constraints does not
+need to be called twice.
+
+Signed-off-by: Christian Kohlschütter <christian@kohlschutter.com>
+---
+ drivers/regulator/core.c | 58 ++++++++++++++++++++++++----------------
+ 1 file changed, 35 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 77f60eef960..2ff0ab2730f 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -5391,6 +5391,7 @@ regulator_register(const struct regulator_desc *regulator_desc,
+ 	bool dangling_of_gpiod = false;
+ 	struct device *dev;
+ 	int ret, i;
++	bool resolved_early = false;
+ 
+ 	if (cfg == NULL)
+ 		return ERR_PTR(-EINVAL);
+@@ -5494,24 +5495,10 @@ regulator_register(const struct regulator_desc *regulator_desc,
+ 	BLOCKING_INIT_NOTIFIER_HEAD(&rdev->notifier);
+ 	INIT_DELAYED_WORK(&rdev->disable_work, regulator_disable_work);
+ 
+-	/* preform any regulator specific init */
+-	if (init_data && init_data->regulator_init) {
+-		ret = init_data->regulator_init(rdev->reg_data);
+-		if (ret < 0)
+-			goto clean;
+-	}
+-
+-	if (config->ena_gpiod) {
+-		ret = regulator_ena_gpio_request(rdev, config);
+-		if (ret != 0) {
+-			rdev_err(rdev, "Failed to request enable GPIO: %pe\n",
+-				 ERR_PTR(ret));
+-			goto clean;
+-		}
+-		/* The regulator core took over the GPIO descriptor */
+-		dangling_cfg_gpiod = false;
+-		dangling_of_gpiod = false;
+-	}
++	if (init_data && init_data->supply_regulator)
++		rdev->supply_name = init_data->supply_regulator;
++	else if (regulator_desc->supply_name)
++		rdev->supply_name = regulator_desc->supply_name;
+ 
+ 	/* register with sysfs */
+ 	rdev->dev.class = &regulator_class;
+@@ -5533,13 +5520,38 @@ regulator_register(const struct regulator_desc *regulator_desc,
+ 		goto wash;
+ 	}
+ 
+-	if (init_data && init_data->supply_regulator)
+-		rdev->supply_name = init_data->supply_regulator;
+-	else if (regulator_desc->supply_name)
+-		rdev->supply_name = regulator_desc->supply_name;
++	if ((rdev->supply_name && !rdev->supply) &&
++		(rdev->constraints->always_on ||
++		 rdev->constraints->boot_on)) {
++		ret = regulator_resolve_supply(rdev);
++		if (ret != 0)
++			rdev_dbg(rdev, "Unable to resolve supply early: %pe\n",
++				 ERR_PTR(ret));
++
++		resolved_early = true;
++	}
++
++	/* perform any regulator specific init */
++	if (init_data && init_data->regulator_init) {
++		ret = init_data->regulator_init(rdev->reg_data);
++		if (ret < 0)
++			goto wash;
++	}
++
++	if (config->ena_gpiod) {
++		ret = regulator_ena_gpio_request(rdev, config);
++		if (ret != 0) {
++			rdev_err(rdev, "Failed to request enable GPIO: %pe\n",
++					 ERR_PTR(ret));
++			goto wash;
++		}
++		/* The regulator core took over the GPIO descriptor */
++		dangling_cfg_gpiod = false;
++		dangling_of_gpiod = false;
++	}
+ 
+ 	ret = set_machine_constraints(rdev);
+-	if (ret == -EPROBE_DEFER) {
++	if (ret == -EPROBE_DEFER && !resolved_early) {
+ 		/* Regulator might be in bypass mode and so needs its supply
+ 		 * to set the constraints
+ 		 */
+-- 
+2.36.2
+
